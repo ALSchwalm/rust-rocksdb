@@ -198,6 +198,11 @@ fn build_rocksdb() {
         config.define("WITH_JEMALLOC", "ON");
     }
 
+    if target.contains("linux") && cfg!(feature = "io-uring") {
+        pkg_config::probe_library("liburing").unwrap();
+        config.define("ROCKSDB_IOURING_PRESENT", Some("1"));
+    }
+
     if target.contains("msvc") {
         config.flag("-EHsc");
     } else {
