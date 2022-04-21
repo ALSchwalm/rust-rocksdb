@@ -67,7 +67,7 @@ pub trait ThreadMode {
 ///
 /// See [`DB`] for more details, including performance implications for each mode
 pub struct SingleThreaded {
-    cfs: BTreeMap<String, ColumnFamily>,
+    pub(crate) cfs: BTreeMap<String, ColumnFamily>,
 }
 
 /// Actual marker type for the marker trait `ThreadMode`, which holds
@@ -76,7 +76,7 @@ pub struct SingleThreaded {
 ///
 /// See [`DB`] for more details, including performance implications for each mode
 pub struct MultiThreaded {
-    cfs: RwLock<BTreeMap<String, Arc<UnboundColumnFamily>>>,
+    pub(crate) cfs: RwLock<BTreeMap<String, Arc<UnboundColumnFamily>>>,
 }
 
 impl ThreadMode for SingleThreaded {
@@ -116,22 +116,36 @@ impl ThreadMode for MultiThreaded {
     }
 }
 
-/// A RocksDB database.
+/// Get underlying `rocksdb_t`.
+pub trait DBInner {
+    fn inner(&self) -> *mut ffi::rocksdb_t;
+}
+
+/// A helper type to implement some common methods for [`DBWithThreadMode`]
+/// and [`OptimisticTransactionDB`].
 ///
-/// This is previously named [`DB`], which is a type alias now for compatibility.
-///
-/// See crate level documentation for a simple usage example.
-pub struct DBWithThreadMode<T: ThreadMode> {
-    pub(crate) inner: *mut ffi::rocksdb_t,
+/// [`OptimisticTransactionDB`]: crate::OptimisticTransactionDB
+pub struct DBCommon<T: ThreadMode, I: DBInner> {
+    pub(crate) inner: I,
     cfs: T, // Column families are held differently depending on thread mode
     path: PathBuf,
     _outlive: Vec<OptionsMustOutliveDB>,
 }
 
-/// Minimal set of DB-related methods, intended to be  generic over
+/// Minimal set of DB-related methods, intended to be generic over
 /// `DBWithThreadMode<T>`. Mainly used internally
 pub trait DBAccess {
-    fn inner(&self) -> *mut ffi::rocksdb_t;
+    fn create_snapshot(&self) -> *const ffi::rocksdb_snapshot_t;
+
+    fn release_snapshot(&self, snapshot: *const ffi::rocksdb_snapshot_t);
+
+    fn create_iterator(&self, readopts: &ReadOptions) -> *mut ffi::rocksdb_iterator_t;
+
+    fn create_iterator_cf(
+        &self,
+        cf_handle: *mut ffi::rocksdb_column_family_handle_t,
+        readopts: &ReadOptions,
+    ) -> *mut ffi::rocksdb_iterator_t;
 
     fn get_opt<K: AsRef<[u8]>>(
         &self,
@@ -179,9 +193,27 @@ pub trait DBAccess {
         W: AsColumnFamilyRef + 'b;
 }
 
-impl<T: ThreadMode> DBAccess for DBWithThreadMode<T> {
-    fn inner(&self) -> *mut ffi::rocksdb_t {
-        self.inner
+impl<T: ThreadMode, I: DBInner> DBAccess for DBCommon<T, I> {
+    fn create_snapshot(&self) -> *const ffi::rocksdb_snapshot_t {
+        unsafe { ffi::rocksdb_create_snapshot(self.inner.inner()) }
+    }
+
+    fn release_snapshot(&self, snapshot: *const ffi::rocksdb_snapshot_t) {
+        unsafe {
+            ffi::rocksdb_release_snapshot(self.inner.inner(), snapshot);
+        }
+    }
+
+    fn create_iterator(&self, readopts: &ReadOptions) -> *mut ffi::rocksdb_iterator_t {
+        unsafe { ffi::rocksdb_create_iterator(self.inner.inner(), readopts.inner) }
+    }
+
+    fn create_iterator_cf(
+        &self,
+        cf_handle: *mut ffi::rocksdb_column_family_handle_t,
+        readopts: &ReadOptions,
+    ) -> *mut ffi::rocksdb_iterator_t {
+        unsafe { ffi::rocksdb_create_iterator_cf(self.inner.inner(), readopts.inner, cf_handle) }
     }
 
     fn get_opt<K: AsRef<[u8]>>(
@@ -244,13 +276,37 @@ impl<T: ThreadMode> DBAccess for DBWithThreadMode<T> {
     }
 }
 
+pub struct DBWithThreadModeInner {
+    inner: *mut ffi::rocksdb_t,
+}
+
+impl DBInner for DBWithThreadModeInner {
+    fn inner(&self) -> *mut ffi::rocksdb_t {
+        self.inner
+    }
+}
+
+impl Drop for DBWithThreadModeInner {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::rocksdb_close(self.inner);
+        }
+    }
+}
+
+/// A type alias to RocksDB database.
+///
+/// See crate level documentation for a simple usage example.
+/// See [`DBCommon`] for full list of methods.
+pub type DBWithThreadMode<T> = DBCommon<T, DBWithThreadModeInner>;
+
 /// A type alias to DB instance type with the single-threaded column family
 /// creations/deletions
 ///
 /// # Compatibility and multi-threaded mode
 ///
 /// Previously, [`DB`] was defined as a direct `struct`. Now, it's type-aliased for
-/// compatibility. Use `DBWithThreadMode<MultiThreaded>` for multi-threaded
+/// compatibility. Use `DBCommon<MultiThreaded>` for multi-threaded
 /// column family alternations.
 ///
 /// # Limited performance implication for single-threaded mode
@@ -289,6 +345,7 @@ enum AccessType<'a> {
     WithTTL { ttl: Duration },
 }
 
+/// Methods of `DBWithThreadMode`.
 impl<T: ThreadMode> DBWithThreadMode<T> {
     /// Opens a database with default options.
     pub fn open_default<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
@@ -595,7 +652,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         }
 
         Ok(Self {
-            inner: db,
+            inner: DBWithThreadModeInner { inner: db },
             path: path.as_ref().to_path_buf(),
             cfs: T::new_cf_map_internal(cf_map),
             _outlive: outlive,
@@ -693,6 +750,79 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         Ok(db)
     }
 
+    /// Removes the database entries in the range `["from", "to")` using given write options.
+    pub fn delete_range_cf_opt<K: AsRef<[u8]>>(
+        &self,
+        cf: &impl AsColumnFamilyRef,
+        from: K,
+        to: K,
+        writeopts: &WriteOptions,
+    ) -> Result<(), Error> {
+        let from = from.as_ref();
+        let to = to.as_ref();
+
+        unsafe {
+            ffi_try!(ffi::rocksdb_delete_range_cf(
+                self.inner.inner(),
+                writeopts.inner,
+                cf.inner(),
+                from.as_ptr() as *const c_char,
+                from.len() as size_t,
+                to.as_ptr() as *const c_char,
+                to.len() as size_t,
+            ));
+            Ok(())
+        }
+    }
+
+    /// Removes the database entries in the range `["from", "to")` using default write options.
+    pub fn delete_range_cf<K: AsRef<[u8]>>(
+        &self,
+        cf: &impl AsColumnFamilyRef,
+        from: K,
+        to: K,
+    ) -> Result<(), Error> {
+        self.delete_range_cf_opt(cf, from, to, &WriteOptions::default())
+    }
+
+    pub fn write_opt(&self, batch: WriteBatch, writeopts: &WriteOptions) -> Result<(), Error> {
+        unsafe {
+            ffi_try!(ffi::rocksdb_write(
+                self.inner.inner(),
+                writeopts.inner,
+                batch.inner
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn write(&self, batch: WriteBatch) -> Result<(), Error> {
+        self.write_opt(batch, &WriteOptions::default())
+    }
+
+    pub fn write_without_wal(&self, batch: WriteBatch) -> Result<(), Error> {
+        let mut wo = WriteOptions::new();
+        wo.disable_wal(true);
+        self.write_opt(batch, &wo)
+    }
+}
+
+/// Common methods of `DBWithThreadMode` and `OptimisticTransactionDB`.
+impl<T: ThreadMode, Inner: DBInner> DBCommon<T, Inner> {
+    pub(crate) fn new(
+        inner: Inner,
+        cfs: T,
+        path: PathBuf,
+        outlive: Vec<OptionsMustOutliveDB>,
+    ) -> Self {
+        Self {
+            inner,
+            cfs,
+            path,
+            _outlive: outlive,
+        }
+    }
+
     pub fn list_cf<P: AsRef<Path>>(opts: &Options, path: P) -> Result<Vec<String>, Error> {
         let cpath = to_cpath(path)?;
         let mut length = 0;
@@ -737,7 +867,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     /// the data to disk.
     pub fn flush_wal(&self, sync: bool) -> Result<(), Error> {
         unsafe {
-            ffi_try!(ffi::rocksdb_flush_wal(self.inner, sync as u8));
+            ffi_try!(ffi::rocksdb_flush_wal(self.inner.inner(), sync as u8));
         }
         Ok(())
     }
@@ -745,7 +875,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     /// Flushes database memtables to SST files on the disk.
     pub fn flush_opt(&self, flushopts: &FlushOptions) -> Result<(), Error> {
         unsafe {
-            ffi_try!(ffi::rocksdb_flush(self.inner, flushopts.inner));
+            ffi_try!(ffi::rocksdb_flush(self.inner.inner(), flushopts.inner));
         }
         Ok(())
     }
@@ -763,7 +893,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     ) -> Result<(), Error> {
         unsafe {
             ffi_try!(ffi::rocksdb_flush_cf(
-                self.inner,
+                self.inner.inner(),
                 flushopts.inner,
                 cf.inner()
             ));
@@ -775,23 +905,6 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     /// options.
     pub fn flush_cf(&self, cf: &impl AsColumnFamilyRef) -> Result<(), Error> {
         self.flush_cf_opt(cf, &FlushOptions::default())
-    }
-
-    pub fn write_opt(&self, batch: WriteBatch, writeopts: &WriteOptions) -> Result<(), Error> {
-        unsafe {
-            ffi_try!(ffi::rocksdb_write(self.inner, writeopts.inner, batch.inner));
-        }
-        Ok(())
-    }
-
-    pub fn write(&self, batch: WriteBatch) -> Result<(), Error> {
-        self.write_opt(batch, &WriteOptions::default())
-    }
-
-    pub fn write_without_wal(&self, batch: WriteBatch) -> Result<(), Error> {
-        let mut wo = WriteOptions::new();
-        wo.disable_wal(true);
-        self.write_opt(batch, &wo)
     }
 
     /// Return the bytes associated with a key value with read options. If you only intend to use
@@ -855,7 +968,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let key = key.as_ref();
         unsafe {
             let val = ffi_try!(ffi::rocksdb_get_pinned(
-                self.inner,
+                self.inner.inner(),
                 readopts.inner,
                 key.as_ptr() as *const c_char,
                 key.len() as size_t,
@@ -895,7 +1008,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let key = key.as_ref();
         unsafe {
             let val = ffi_try!(ffi::rocksdb_get_pinned_cf(
-                self.inner,
+                self.inner.inner(),
                 readopts.inner,
                 cf.inner(),
                 key.as_ptr() as *const c_char,
@@ -950,7 +1063,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let mut errors = vec![ptr::null_mut(); keys.len()];
         unsafe {
             ffi::rocksdb_multi_get(
-                self.inner,
+                self.inner.inner(),
                 readopts.inner,
                 ptr_keys.len(),
                 ptr_keys.as_ptr(),
@@ -1006,7 +1119,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let mut errors = vec![ptr::null_mut(); ptr_keys.len()];
         unsafe {
             ffi::rocksdb_multi_get_cf(
-                self.inner,
+                self.inner.inner(),
                 readopts.inner,
                 ptr_cfs.as_ptr(),
                 ptr_keys.len(),
@@ -1033,7 +1146,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let key = key.as_ref();
         unsafe {
             0 != ffi::rocksdb_key_may_exist(
-                self.inner,
+                self.inner.inner(),
                 readopts.inner,
                 key.as_ptr() as *const c_char,
                 key.len() as size_t,
@@ -1063,7 +1176,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let key = key.as_ref();
         0 != unsafe {
             ffi::rocksdb_key_may_exist_cf(
-                self.inner,
+                self.inner.inner(),
                 readopts.inner,
                 cf.inner(),
                 key.as_ptr() as *const c_char,
@@ -1091,7 +1204,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         };
         Ok(unsafe {
             ffi_try!(ffi::rocksdb_create_column_family(
-                self.inner,
+                self.inner.inner(),
                 opts.inner,
                 cf_name.as_ptr(),
             ))
@@ -1230,7 +1343,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
 
         unsafe {
             ffi_try!(ffi::rocksdb_put(
-                self.inner,
+                self.inner.inner(),
                 writeopts.inner,
                 key.as_ptr() as *const c_char,
                 key.len() as size_t,
@@ -1257,7 +1370,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
 
         unsafe {
             ffi_try!(ffi::rocksdb_put_cf(
-                self.inner,
+                self.inner.inner(),
                 writeopts.inner,
                 cf.inner(),
                 key.as_ptr() as *const c_char,
@@ -1279,7 +1392,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
 
         unsafe {
             ffi_try!(ffi::rocksdb_merge(
-                self.inner,
+                self.inner.inner(),
                 writeopts.inner,
                 key.as_ptr() as *const c_char,
                 key.len() as size_t,
@@ -1306,7 +1419,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
 
         unsafe {
             ffi_try!(ffi::rocksdb_merge_cf(
-                self.inner,
+                self.inner.inner(),
                 writeopts.inner,
                 cf.inner(),
                 key.as_ptr() as *const c_char,
@@ -1327,7 +1440,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
 
         unsafe {
             ffi_try!(ffi::rocksdb_delete(
-                self.inner,
+                self.inner.inner(),
                 writeopts.inner,
                 key.as_ptr() as *const c_char,
                 key.len() as size_t,
@@ -1346,36 +1459,11 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
 
         unsafe {
             ffi_try!(ffi::rocksdb_delete_cf(
-                self.inner,
+                self.inner.inner(),
                 writeopts.inner,
                 cf.inner(),
                 key.as_ptr() as *const c_char,
                 key.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
-    /// Removes the database entries in the range `["from", "to")` using given write options.
-    pub fn delete_range_cf_opt<K: AsRef<[u8]>>(
-        &self,
-        cf: &impl AsColumnFamilyRef,
-        from: K,
-        to: K,
-        writeopts: &WriteOptions,
-    ) -> Result<(), Error> {
-        let from = from.as_ref();
-        let to = to.as_ref();
-
-        unsafe {
-            ffi_try!(ffi::rocksdb_delete_range_cf(
-                self.inner,
-                writeopts.inner,
-                cf.inner(),
-                from.as_ptr() as *const c_char,
-                from.len() as size_t,
-                to.as_ptr() as *const c_char,
-                to.len() as size_t,
             ));
             Ok(())
         }
@@ -1425,16 +1513,6 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         self.delete_cf_opt(cf, key.as_ref(), &WriteOptions::default())
     }
 
-    /// Removes the database entries in the range `["from", "to")` using default write options.
-    pub fn delete_range_cf<K: AsRef<[u8]>>(
-        &self,
-        cf: &impl AsColumnFamilyRef,
-        from: K,
-        to: K,
-    ) -> Result<(), Error> {
-        self.delete_range_cf_opt(cf, from, to, &WriteOptions::default())
-    }
-
     /// Runs a manual compaction on the Range of keys given. This is not likely to be needed for typical usage.
     pub fn compact_range<S: AsRef<[u8]>, E: AsRef<[u8]>>(&self, start: Option<S>, end: Option<E>) {
         unsafe {
@@ -1442,7 +1520,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
             let end = end.as_ref().map(AsRef::as_ref);
 
             ffi::rocksdb_compact_range(
-                self.inner,
+                self.inner.inner(),
                 opt_bytes_to_ptr(start),
                 start.map_or(0, <[u8]>::len) as size_t,
                 opt_bytes_to_ptr(end),
@@ -1463,7 +1541,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
             let end = end.as_ref().map(AsRef::as_ref);
 
             ffi::rocksdb_compact_range_opt(
-                self.inner,
+                self.inner.inner(),
                 opts.inner,
                 opt_bytes_to_ptr(start),
                 start.map_or(0, <[u8]>::len) as size_t,
@@ -1486,7 +1564,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
             let end = end.as_ref().map(AsRef::as_ref);
 
             ffi::rocksdb_compact_range_cf(
-                self.inner,
+                self.inner.inner(),
                 cf.inner(),
                 opt_bytes_to_ptr(start),
                 start.map_or(0, <[u8]>::len) as size_t,
@@ -1509,7 +1587,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
             let end = end.as_ref().map(AsRef::as_ref);
 
             ffi::rocksdb_compact_range_cf_opt(
-                self.inner,
+                self.inner.inner(),
                 cf.inner(),
                 opts.inner,
                 opt_bytes_to_ptr(start),
@@ -1527,7 +1605,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let count = opts.len() as i32;
         unsafe {
             ffi_try!(ffi::rocksdb_set_options(
-                self.inner,
+                self.inner.inner(),
                 count,
                 cnames.as_ptr(),
                 cvalues.as_ptr(),
@@ -1547,7 +1625,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let count = opts.len() as i32;
         unsafe {
             ffi_try!(ffi::rocksdb_set_options_cf(
-                self.inner,
+                self.inner.inner(),
                 cf.inner(),
                 count,
                 cnames.as_ptr(),
@@ -1573,7 +1651,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         };
 
         unsafe {
-            let value = ffi::rocksdb_property_value(self.inner, prop_name.as_ptr());
+            let value = ffi::rocksdb_property_value(self.inner.inner(), prop_name.as_ptr());
             if value.is_null() {
                 return Ok(None);
             }
@@ -1613,7 +1691,8 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         };
 
         unsafe {
-            let value = ffi::rocksdb_property_value_cf(self.inner, cf.inner(), prop_name.as_ptr());
+            let value =
+                ffi::rocksdb_property_value_cf(self.inner.inner(), cf.inner(), prop_name.as_ptr());
             if value.is_null() {
                 return Ok(None);
             }
@@ -1675,7 +1754,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
 
     /// The sequence number of the most recent transaction.
     pub fn latest_sequence_number(&self) -> u64 {
-        unsafe { ffi::rocksdb_get_latest_sequence_number(self.inner) }
+        unsafe { ffi::rocksdb_get_latest_sequence_number(self.inner.inner()) }
     }
 
     /// Iterate over batches of write operations since a given sequence.
@@ -1694,7 +1773,11 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
             // for creating and destroying it; fortunately we can pass a nullptr
             // here to get the default behavior
             let opts: *const ffi::rocksdb_wal_readoptions_t = ptr::null();
-            let iter = ffi_try!(ffi::rocksdb_get_updates_since(self.inner, seq_number, opts));
+            let iter = ffi_try!(ffi::rocksdb_get_updates_since(
+                self.inner.inner(),
+                seq_number,
+                opts
+            ));
             Ok(DBWALIterator { inner: iter })
         }
     }
@@ -1703,7 +1786,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     /// log files.
     pub fn try_catch_up_with_primary(&self) -> Result<(), Error> {
         unsafe {
-            ffi_try!(ffi::rocksdb_try_catch_up_with_primary(self.inner));
+            ffi_try!(ffi::rocksdb_try_catch_up_with_primary(self.inner.inner()));
         }
         Ok(())
     }
@@ -1766,7 +1849,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     ) -> Result<(), Error> {
         unsafe {
             ffi_try!(ffi::rocksdb_ingest_external_file(
-                self.inner,
+                self.inner.inner(),
                 cpaths.as_ptr(),
                 paths_v.len(),
                 opts.inner as *const _
@@ -1784,7 +1867,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     ) -> Result<(), Error> {
         unsafe {
             ffi_try!(ffi::rocksdb_ingest_external_file_cf(
-                self.inner,
+                self.inner.inner(),
                 cf.inner(),
                 cpaths.as_ptr(),
                 paths_v.len(),
@@ -1798,7 +1881,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     /// and end key
     pub fn live_files(&self) -> Result<Vec<LiveFile>, Error> {
         unsafe {
-            let files = ffi::rocksdb_livefiles(self.inner);
+            let files = ffi::rocksdb_livefiles(self.inner.inner());
             if files.is_null() {
                 Err(Error::new("Could not get live files".to_owned()))
             } else {
@@ -1856,7 +1939,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let to = to.as_ref();
         unsafe {
             ffi_try!(ffi::rocksdb_delete_file_in_range(
-                self.inner,
+                self.inner.inner(),
                 from.as_ptr() as *const c_char,
                 from.len() as size_t,
                 to.as_ptr() as *const c_char,
@@ -1877,7 +1960,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         let to = to.as_ref();
         unsafe {
             ffi_try!(ffi::rocksdb_delete_file_in_range_cf(
-                self.inner,
+                self.inner.inner(),
                 cf.inner(),
                 from.as_ptr() as *const c_char,
                 from.len() as size_t,
@@ -1891,7 +1974,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     /// Request stopping background work, if wait is true wait until it's done.
     pub fn cancel_all_background_work(&self, wait: bool) {
         unsafe {
-            ffi::rocksdb_cancel_all_background_work(self.inner, wait as u8);
+            ffi::rocksdb_cancel_all_background_work(self.inner.inner(), wait as u8);
         }
     }
 
@@ -1902,7 +1985,10 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     ) -> Result<(), Error> {
         unsafe {
             // first mark the column family as dropped
-            ffi_try!(ffi::rocksdb_drop_column_family(self.inner, cf_inner));
+            ffi_try!(ffi::rocksdb_drop_column_family(
+                self.inner.inner(),
+                cf_inner
+            ));
         }
         // then finally reclaim any resources (mem, files) by destroying the only single column
         // family handle by drop()-ing it
@@ -1911,7 +1997,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
     }
 }
 
-impl DBWithThreadMode<SingleThreaded> {
+impl<I: DBInner> DBCommon<SingleThreaded, I> {
     /// Creates column family with given name and options
     pub fn create_cf<N: AsRef<str>>(&mut self, name: N, opts: &Options) -> Result<(), Error> {
         let inner = self.create_inner_cf_handle(name.as_ref(), opts)?;
@@ -1936,7 +2022,7 @@ impl DBWithThreadMode<SingleThreaded> {
     }
 }
 
-impl DBWithThreadMode<MultiThreaded> {
+impl<I: DBInner> DBCommon<MultiThreaded, I> {
     /// Creates column family with given name and options
     pub fn create_cf<N: AsRef<str>>(&self, name: N, opts: &Options) -> Result<(), Error> {
         let inner = self.create_inner_cf_handle(name.as_ref(), opts)?;
@@ -1969,16 +2055,13 @@ impl DBWithThreadMode<MultiThreaded> {
     }
 }
 
-impl<T: ThreadMode> Drop for DBWithThreadMode<T> {
+impl<T: ThreadMode, I: DBInner> Drop for DBCommon<T, I> {
     fn drop(&mut self) {
-        unsafe {
-            self.cfs.drop_all_cfs_internal();
-            ffi::rocksdb_close(self.inner);
-        }
+        self.cfs.drop_all_cfs_internal();
     }
 }
 
-impl<T: ThreadMode> fmt::Debug for DBWithThreadMode<T> {
+impl<T: ThreadMode, I: DBInner> fmt::Debug for DBCommon<T, I> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "RocksDB {{ path: {:?} }}", self.path())
     }
