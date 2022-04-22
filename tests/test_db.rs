@@ -23,7 +23,7 @@ use rocksdb::{
     ColumnFamilyDescriptor, CompactOptions, CuckooTableOptions, DBCompactionStyle,
     DBWithThreadMode, Env, Error, ErrorKind, FifoCompactOptions, IteratorMode, MultiThreaded,
     Options, PerfContext, PerfMetric, ReadOptions, SingleThreaded, SliceTransform, Snapshot,
-    UniversalCompactOptions, UniversalCompactionStopStyle, WriteBatch, DB,
+    UniversalCompactOptions, UniversalCompactionStopStyle, WriteBatch, DB, DBAccess
 };
 use util::DBPath;
 

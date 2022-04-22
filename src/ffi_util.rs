@@ -80,3 +80,26 @@ macro_rules! ffi_try_impl {
         result
     }};
 }
+
+pub(crate) fn convert_values(
+    values: Vec<*mut c_char>,
+    values_sizes: Vec<usize>,
+    errors: Vec<*mut c_char>,
+) -> Vec<Result<Option<Vec<u8>>, Error>> {
+    values
+        .into_iter()
+        .zip(values_sizes.into_iter())
+        .zip(errors.into_iter())
+        .map(|((v, s), e)| {
+            if e.is_null() {
+                let value = unsafe { raw_data(v, s) };
+                unsafe {
+                    crate::ffi::rocksdb_free(v as *mut c_void);
+                }
+                Ok(value)
+            } else {
+                Err(Error::new(error_message(e)))
+            }
+        })
+        .collect()
+}

@@ -19,7 +19,7 @@ use crate::{
     column_family::UnboundColumnFamily,
     db_options::OptionsMustOutliveDB,
     ffi,
-    ffi_util::{from_cstr, opt_bytes_to_ptr, raw_data, to_cpath},
+    ffi_util::{from_cstr, opt_bytes_to_ptr, raw_data, to_cpath, convert_values},
     ColumnFamily, ColumnFamilyDescriptor, CompactOptions, DBIteratorWithThreadMode,
     DBPinnableSlice, DBRawIteratorWithThreadMode, DBWALIterator, Direction, Error, FlushOptions,
     IngestExternalFileOptions, IteratorMode, Options, ReadOptions, SnapshotWithThreadMode,
@@ -193,7 +193,7 @@ pub trait DBAccess {
         W: AsColumnFamilyRef + 'b;
 }
 
-impl<T: ThreadMode, I: DBInner> DBAccess for DBCommon<T, I> {
+impl<T: ThreadMode, D: DBInner> DBAccess for DBCommon<T, D> {
     fn create_snapshot(&self) -> *const ffi::rocksdb_snapshot_t {
         unsafe { ffi::rocksdb_create_snapshot(self.inner.inner()) }
     }
@@ -388,7 +388,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
 
     /// Opens the database with a Time to Live compaction filter and column family names.
     ///
-    /// Column families opened using this function will be created with default `Options`.    
+    /// Column families opened using this function will be created with default `Options`.
     pub fn open_cf_with_ttl<P, I, N>(
         opts: &Options,
         path: P,
@@ -2100,29 +2100,6 @@ fn convert_options(opts: &[(&str, &str)]) -> Result<Vec<(CString, CString)>, Err
                 Err(e) => return Err(Error::new(format!("Invalid option value: `{}`", e))),
             };
             Ok((cname, cvalue))
-        })
-        .collect()
-}
-
-fn convert_values(
-    values: Vec<*mut c_char>,
-    values_sizes: Vec<usize>,
-    errors: Vec<*mut c_char>,
-) -> Vec<Result<Option<Vec<u8>>, Error>> {
-    values
-        .into_iter()
-        .zip(values_sizes.into_iter())
-        .zip(errors.into_iter())
-        .map(|((v, s), e)| {
-            if e.is_null() {
-                let value = unsafe { crate::ffi_util::raw_data(v, s) };
-                unsafe {
-                    ffi::rocksdb_free(v as *mut c_void);
-                }
-                Ok(value)
-            } else {
-                Err(Error::new(crate::ffi_util::error_message(e)))
-            }
         })
         .collect()
 }

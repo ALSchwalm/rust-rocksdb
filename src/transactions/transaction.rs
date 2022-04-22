@@ -13,12 +13,14 @@
 // limitations under the License.
 //
 
+use std::ptr;
 use std::marker::PhantomData;
 
 use crate::{
     db::DBAccess, ffi, AsColumnFamilyRef, DBIteratorWithThreadMode, DBPinnableSlice,
     DBRawIteratorWithThreadMode, Direction, Error, IteratorMode, ReadOptions,
     SnapshotWithThreadMode, WriteBatchWithTransaction,
+    ffi_util::convert_values
 };
 use libc::{c_char, c_void, size_t};
 
@@ -75,6 +77,48 @@ impl<'db, DB> DBAccess for Transaction<'db, DB> {
         readopts: &ReadOptions,
     ) -> Result<Option<Vec<u8>>, Error> {
         self.get_cf_opt(cf, key, readopts)
+    }
+
+    fn get_pinned_opt<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+        readopts: &ReadOptions,
+    ) -> Result<Option<DBPinnableSlice>, Error> {
+        self.get_pinned_opt(key, readopts)
+    }
+
+    fn get_pinned_cf_opt<K: AsRef<[u8]>>(
+        &self,
+        cf: &impl AsColumnFamilyRef,
+        key: K,
+        readopts: &ReadOptions,
+    ) -> Result<Option<DBPinnableSlice>, Error> {
+        self.get_pinned_cf_opt(cf, key, readopts)
+    }
+
+    fn multi_get_opt<K, I>(
+        &self,
+        keys: I,
+        readopts: &ReadOptions,
+    ) -> Vec<Result<Option<Vec<u8>>, Error>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = K>,
+    {
+        self.multi_get_opt(keys, readopts)
+    }
+
+    fn multi_get_cf_opt<'b, K, I, W>(
+        &self,
+        keys_cf: I,
+        readopts: &ReadOptions,
+    ) -> Vec<Result<Option<Vec<u8>>, Error>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = (&'b W, K)>,
+        W: AsColumnFamilyRef + 'b,
+    {
+        self.multi_get_cf_opt(keys_cf, readopts)
     }
 }
 
@@ -588,6 +632,83 @@ impl<'db, DB> Transaction<'db, DB> {
             ));
         }
         Ok(())
+    }
+
+    fn multi_get_opt<K, I>(
+        &self,
+        keys: I,
+        readopts: &ReadOptions,
+    ) -> Vec<Result<Option<Vec<u8>>, Error>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = K>,
+    {
+        let (keys, keys_sizes): (Vec<Box<[u8]>>, Vec<_>) = keys
+            .into_iter()
+            .map(|k| (Box::from(k.as_ref()), k.as_ref().len()))
+            .unzip();
+        let ptr_keys: Vec<_> = keys.iter().map(|k| k.as_ptr() as *const c_char).collect();
+
+        let mut values = vec![ptr::null_mut(); keys.len()];
+        let mut values_sizes = vec![0_usize; keys.len()];
+        let mut errors = vec![ptr::null_mut(); keys.len()];
+        unsafe {
+            ffi::rocksdb_transaction_multi_get(
+                self.inner,
+                readopts.inner,
+                ptr_keys.len(),
+                ptr_keys.as_ptr(),
+                keys_sizes.as_ptr(),
+                values.as_mut_ptr(),
+                values_sizes.as_mut_ptr(),
+                errors.as_mut_ptr(),
+            );
+        }
+
+        convert_values(values, values_sizes, errors)
+    }
+
+    fn multi_get_cf_opt<'b, K, I, W>(
+        &self,
+        keys_cf: I,
+        readopts: &ReadOptions,
+    ) -> Vec<Result<Option<Vec<u8>>, Error>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = (&'b W, K)>,
+        W: AsColumnFamilyRef + 'b,
+    {
+        let (cfs_and_keys, keys_sizes): (Vec<(_, Box<[u8]>)>, Vec<_>) = keys_cf
+            .into_iter()
+            .map(|(cf, key)| ((cf, Box::from(key.as_ref())), key.as_ref().len()))
+            .unzip();
+        let ptr_keys: Vec<_> = cfs_and_keys
+            .iter()
+            .map(|(_, k)| k.as_ptr() as *const c_char)
+            .collect();
+        let ptr_cfs: Vec<_> = cfs_and_keys
+            .iter()
+            .map(|(c, _)| c.inner() as *const _)
+            .collect();
+
+        let mut values = vec![ptr::null_mut(); ptr_keys.len()];
+        let mut values_sizes = vec![0_usize; ptr_keys.len()];
+        let mut errors = vec![ptr::null_mut(); ptr_keys.len()];
+        unsafe {
+            ffi::rocksdb_transaction_multi_get_cf(
+                self.inner,
+                readopts.inner,
+                ptr_cfs.as_ptr(),
+                ptr_keys.len(),
+                ptr_keys.as_ptr(),
+                keys_sizes.as_ptr(),
+                values.as_mut_ptr(),
+                values_sizes.as_mut_ptr(),
+                errors.as_mut_ptr(),
+            );
+        }
+
+        convert_values(values, values_sizes, errors)
     }
 
     pub fn iterator<'a: 'b, 'b>(
